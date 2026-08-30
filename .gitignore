@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# pgn-fix: CLI run artifacts (regenerate anytime, never commit)
+/*.corrected.pgn
+/*.report.txt
