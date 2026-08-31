@@ -56,6 +56,28 @@ The report is a plain-text table, e.g.:
 47...  substantive  medium  kd7       Kc7
 ```
 
+Every **substantive** (and unresolved) row also gets a "Why" entry after
+the table, spelling out the concrete reason, e.g.:
+
+```
+Why:
+  34. 'b4+' -> 'a4': 'b4+/Kb6' is legal here, but only lets 11 of the next 28
+      recorded move(s) that follow make sense afterwards -- keeping it, the
+      next move that stops making sense is recorded move 12 of what follows
+      ('Nb2'): no black knight can reach b2 from here. Reading this instead
+      as 'a4/Kb4' lets 23 of them parse -- strong evidence this is what was
+      actually played.
+```
+
+Formatting fixes don't get one, since they're deterministic (exactly one
+legal move matched some cheap, mechanical rewrite) and don't need
+justifying. For a substantive fix, it says why the recorded text doesn't
+play here at all (no piece of that type can reach the square, more than one
+could and the notation doesn't say which, or a missing digit that no
+completion of it fixes). For a revised-earlier-move ("retro") correction, it
+names the *specific* later recorded move that exposes the original reading
+as wrong, and how much more of the game the revision explains.
+
 The move number is written the way PGN itself would ("12." for White,
 "12..." for Black), so it also serves as the color column. It always
 matches the *source file's own* numbering — including any gap or typo

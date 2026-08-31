@@ -54,6 +54,7 @@ import argparse
 import difflib
 import re
 import sys
+import textwrap
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -226,6 +227,60 @@ def _extract_dest_square(core: str) -> Optional[Tuple[int, int]]:
         return None
     last = matches[-1]
     return ord(last[0]) - ord("a"), int(last[1]) - 1
+
+
+_PIECE_NAMES = {"P": "pawn", "N": "knight", "B": "bishop", "R": "rook", "Q": "queen", "K": "king"}
+_PIECE_TYPES = {
+    "P": chess.PAWN, "N": chess.KNIGHT, "B": chess.BISHOP,
+    "R": chess.ROOK, "Q": chess.QUEEN, "K": chess.KING,
+}
+
+
+def _diagnose_illegal(board: "chess.Board", token: str) -> str:
+    """A short, concrete reason ``token`` doesn't play in ``board`` --
+    used to explain a substantive correction rather than just asserting
+    one. Distinguishes the handful of ways python-chess itself rejects a
+    move (ambiguous vs. plain illegal vs. not even move-shaped) and, for
+    the plain-illegal case, checks the actual board for the most useful
+    version of "why": no piece of that type left at all, versus one or
+    more exist but none can reach the named square.
+    """
+    color_name = "White" if board.turn else "Black"
+    core = _core(token)
+    piece = _piece_letter(core)
+    name = _PIECE_NAMES.get(piece, "piece")
+    dest = _extract_dest_square(_PROMO_SUFFIX_RE.sub("", core))
+    square_name = chess.square_name(chess.square(*dest)) if dest else None
+
+    try:
+        board.parse_san(token)
+        return "parses here, but wasn't the move actually played (see below)"
+    except chess.AmbiguousMoveError:
+        where = f" to {square_name}" if square_name else ""
+        return f"more than one {color_name.lower()} {name} can move{where} here; the notation doesn't say which"
+    except (chess.InvalidMoveError, chess.IllegalMoveError, ValueError):
+        pass  # fall through to the board-based diagnosis below, regardless
+        # of which of these python-chess raised -- a mis-cased piece letter
+        # like "nb2" raises InvalidMoveError (python-chess's SAN grammar
+        # requires the capital), but it's a real, recognizable move with
+        # the letter case lost, not garbage, and `_piece_letter`/
+        # `_extract_dest_square` already read it correctly regardless of
+        # case -- so it still deserves the concrete piece/square diagnosis
+        # below rather than a blanket "not recognizable".
+
+    piece_type = _PIECE_TYPES.get(piece)
+    has_piece = piece_type is not None and bool(board.pieces(piece_type, board.turn))
+    if square_name is None:
+        core_wo_promo = _PROMO_SUFFIX_RE.sub("", core)
+        if core_wo_promo and core_wo_promo[-1] in "abcdefgh":
+            return (
+                f"'{token}' is missing its destination rank digit, and no "
+                f"completion of it is a legal {color_name.lower()} move here"
+            )
+        return f"'{token}' isn't recognizable move notation at all"
+    if not has_piece and piece != "P":
+        return f"{color_name} has no {name} left on the board at this point"
+    return f"no {color_name.lower()} {name} can reach {square_name} from here"
 
 
 def similarity_score(token: str, candidate_san: str) -> float:
@@ -513,6 +568,24 @@ def lookahead_matches(
         b.push(mv)
         matched += 1
     return matched
+
+
+def _first_break(
+    board: "chess.Board", future_tokens: List[str]
+) -> Optional[Tuple[int, str, str]]:
+    """Step tolerantly through ``future_tokens`` from ``board`` (see
+    `_parse_san_tolerant`) and return ``(index, token, reason)`` for the
+    first one that doesn't play -- or None if they all do. Used to name
+    the *specific* future move that exposes an earlier ply as wrong,
+    rather than just reporting a lookahead count.
+    """
+    b = board.copy(stack=False)
+    for idx, tok in enumerate(future_tokens):
+        mv = _parse_san_tolerant(b, tok)
+        if mv is None:
+            return idx, tok, _diagnose_illegal(b, tok)
+        b.push(mv)
+    return None
 
 
 def best_single_correction(
@@ -923,7 +996,8 @@ class GameCorrector:
             if not options:
                 history.append(
                     Ply(token, chess.Move.null(), token, flagged=True, confidence="low",
-                        note="no legal move available in this position; left unresolved",
+                        note=f"{_diagnose_illegal(board, token)}, and no other legal move in "
+                             "this position fit well enough to substitute either; left unresolved",
                         category="unresolved", short_note="no legal move", recorded_label=label)
                 )
                 break
@@ -961,9 +1035,10 @@ class GameCorrector:
                     chosen["la"], chosen["sim"], remaining,
                     chosen.get("la_margin"), chosen.get("sim_margin"),
                 )
+                note = self._explain(board, token, chosen["san"], chosen["la"], remaining)
                 board.push(chosen["mv"])
                 history.append(Ply(token, chosen["mv"], chosen["san"], flagged=True,
-                                    confidence=confidence, note=self._explain(token, chosen["san"]),
+                                    confidence=confidence, note=note,
                                     category="substantive", recorded_label=label))
                 i += 1
             elif chosen["kind"] == "merge":
@@ -977,12 +1052,43 @@ class GameCorrector:
                 i += 2
             else:  # "window": revise the last `w` plies plus this one
                 w = chosen["w"]
+                window_tokens = chosen["window_tokens"]
+                window_labels = chosen["window_labels"]
+                assign = chosen["assign"]
+
+                # Diagnose *why* the previously-accepted reading doesn't
+                # hold up, while `board` still reflects it: find the
+                # specific future move that exposes the problem, resolving
+                # the current token as well as the old reading possibly
+                # could first (so the comparison is apples-to-apples with
+                # `best_direct_la`).
+                if direct:
+                    probe = board.copy(stack=False)
+                    probe.push(direct[0]["mv"])
+                    break_info = _first_break(probe, future)
+                else:
+                    break_info = (0, token, _diagnose_illegal(board, token))
+                if break_info is not None:
+                    break_idx, break_tok, break_reason = break_info
+                    old_explain = (
+                        f"keeping it, the next move that stops making sense is "
+                        f"recorded move {break_idx + 1} of what follows ('{break_tok}'): {break_reason}"
+                    )
+                else:
+                    old_explain = "keeping it only explains part of what follows"
+                old_texts = "/".join(window_tokens)
+                new_texts = "/".join(san for _, san, _ in assign)
+                retro_note = (
+                    f"'{old_texts}' is legal here, but only lets {best_direct_la} of the next "
+                    f"{len(future)} recorded move(s) that follow make sense afterwards -- "
+                    f"{old_explain}. Reading {'this' if w == 1 else 'these'} instead as "
+                    f"'{new_texts}' lets {chosen['la']} of them parse -- strong evidence this is "
+                    "what was actually played."
+                )
+
                 for _ in range(w):
                     board.pop()
                 del history[-w:]
-                assign = chosen["assign"]
-                window_tokens = chosen["window_tokens"]
-                window_labels = chosen["window_labels"]
                 for idx, (mv, san, sim) in enumerate(assign):
                     board.push(mv)
                     original_token = window_tokens[idx]
@@ -991,7 +1097,7 @@ class GameCorrector:
                         Ply(original_token, mv, san,
                             flagged=changed or idx == len(assign) - 1,
                             confidence="retro" if changed else "exact",
-                            note="revised after looking ahead in the transcript" if changed else "",
+                            note=retro_note if changed else "",
                             category="substantive",
                             short_note="revised earlier move" if changed else "",
                             recorded_label=window_labels[idx])
@@ -1002,10 +1108,18 @@ class GameCorrector:
         return board, history, corrections
 
     @staticmethod
-    def _explain(token: str, san: str) -> str:
+    def _explain(board: "chess.Board", token: str, san: str, la: int, remaining: int) -> str:
         if _core(token) == _core(san):
             return "formatting only (check/mate marker)"
-        return f"recorded as '{token}', actually '{san}'"
+        reason = _diagnose_illegal(board, token)
+        if remaining:
+            fit = (
+                f"'{san}' explains {la} of the next {remaining} recorded move(s) "
+                "that follow -- the most of any legal candidate here."
+            )
+        else:
+            fit = f"'{san}' is the closest legal match at the end of the transcript."
+        return f"{reason}. {fit}"
 
     @staticmethod
     def _build_report(history: List[Ply]) -> List[Correction]:
@@ -1116,6 +1230,23 @@ def render_report(corrections: List[Correction], total_plies: int) -> str:
     for row in rows:
         lines.append(fmt_row(row))
     lines.append("")
+
+    # Formatting fixes are deterministic (exactly one legal move matched
+    # some cheap, mechanical rewrite) and don't need justifying. Substantive
+    # and unresolved rows involved an actual judgment call, though, so spell
+    # out *why* -- both why the recorded text doesn't work and, for a
+    # revised-earlier-move ("retro") correction, specifically which later
+    # move exposed it and how much more of the game the revision explains.
+    explainable = [c for c in corrections if c.category in ("substantive", "unresolved") and c.note]
+    if explainable:
+        lines.append("Why:")
+        for c in explainable:
+            move_ref = f"{c.move_number}{'.' if c.color == 'White' else '...'}"
+            wrapped = textwrap.fill(
+                c.note, width=78, initial_indent="", subsequent_indent="      "
+            )
+            lines.append(f"  {move_ref} {c.original!r} -> {c.corrected!r}: {wrapped}")
+        lines.append("")
 
     if substantive:
         lines.append(
